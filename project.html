@@ -1,0 +1,895 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<head>
+    <title>CFPB complaints by state</title>
+
+    <script src="lib/d3.v5.min.js"></script>
+    <script src="lib/d3-tip.min.js"></script>
+    <script src="lib/d3-legend.min.js"></script>
+    <script src="lib/d3-geo-projection.v2.min.js"></script>
+    <script src="lib/topojson.v2.min.js"></script>
+
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 16px;
+            color: #222;
+        }
+
+        h1 {
+            font-size: 20px;
+            font-weight: 600;
+            margin: 0 0 8px;
+        }
+
+        .note {
+            max-width: 980px;
+            font-size: 14px;
+            line-height: 1.4;
+            margin: 0 0 12px;
+        }
+
+        label {
+            display: inline-flex;
+            align-items: center;
+            font-size: 14px;
+            margin: 0 18px 8px 0;
+        }
+
+        select {
+            width: 420px;
+            max-width: 100%;
+            margin-left: 6px;
+        }
+
+        #status {
+            font-size: 13px;
+            min-height: 18px;
+        }
+
+        .d3-tip {
+            pointer-events: none !important;
+            background: white;
+            border: 1px solid #999;
+            padding: 8px;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+
+        .axis text {
+            font-size: 11px;
+            fill: #333;
+        }
+
+        .axis path,
+        .axis line {
+            stroke: #ccc;
+        }
+
+        .chart-title,
+        .scope-label {
+            font-size: 13px;
+            font-weight: 600;
+            fill: #222;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Concerns to watch out for in 2025</h1>
+    <p class="note">
+        Choose a company, product, and sub-issue. The map shows 2025. 2026 is left out because the year is not finished.
+        A state is a watch-out when this sub-issue is growing faster than that state's own past and faster than the company's other complaints, and the adjusted no-relief rate is high.
+        Gray means there is not enough data to judge. Hover a state for the share, both growth gaps, and the no-relief rates.
+        The lines show every year through 2025. The pale no-relief line is the raw rate, and the dark line is adjusted for a small number of complaints.
+        Moving off the map returns the lines to the United States.
+    </p>
+
+    <label>Company <select id="companyDropdown"></select></label>
+    <label>Product <select id="productDropdown"></select></label>
+    <label>Sub-issue <select id="subIssueDropdown"></select></label>
+    <p id="status">Loading complaints…</p>
+
+    <script>
+        var mapWidth = 640;
+        var mapHeight = 420;
+        var chartWidth = 460;
+        var chartHeight = 210;
+        var chartGap = 16;
+        var width = mapWidth + 48 + chartWidth;
+        var height = mapHeight + 210;
+        var chartMargin = {top: 36, right: 12, bottom: 28, left: 52};
+        var ALL_COMPANIES = "All companies";
+        var LAST_COMPLETE_YEAR = 2025;
+
+        var svg = d3.select("body")
+            .append("svg")
+            .attr("id", "choropleth")
+            .attr("width", width)
+            .attr("height", height);
+
+        var projection = d3.geoAlbersUsa();
+        var path = d3.geoPath().projection(projection);
+
+        var companies = [];
+        var companyByName = {};
+        var bucketCache = {};
+        var activeRows = [];
+        var prepared = null;
+        var statePaths = null;
+        var loadToken = 0;
+        var selectedYear = null;
+        var activeScope = {id: null, label: "United States"};
+        var hovered = null;
+
+        var shareChart = svg.append("g")
+            .attr("id", "share-chart")
+            .attr("transform", "translate(" + (mapWidth + 48) + ",0)");
+        var rateChart = svg.append("g")
+            .attr("id", "rate-chart")
+            .attr("transform", "translate(" + (mapWidth + 48) + "," + (chartHeight + chartGap) + ")");
+        var scopeLabel = svg.append("text")
+            .attr("class", "scope-label")
+            .attr("x", mapWidth + 48)
+            .attr("y", 16)
+            .text("United States");
+
+        var tip = d3.tip()
+            .attr("class", "d3-tip")
+            .attr("id", "tooltip")
+            .direction("n")
+            .offset([-8, 0])
+            .html(function(d) {
+                var name = escapeHtml(d.properties.name);
+                var rec = stateRecord(d.id);
+                var us = nationalRecord();
+                if (!rec || !(rec.denom > 0)) {
+                    return name + "<br>No complaints in " + selectedYear + ".";
+                }
+                return name + " in " + selectedYear + "<br>"
+                    + "Result: " + watchLabel(rec) + "<br>"
+                    + "Concern score: " + formatSigned(rec.score, ".2f") + "<br>"
+                    + "Versus this state's past: " + formatSigned(rec.within, "+.2f") + "<br>"
+                    + "Versus other complaints: " + formatSigned(rec.excess, "+.2f") + "<br>"
+                    + "Raw no-relief: " + formatPercent(rec.rate) + "<br>"
+                    + "Adjusted no-relief: " + formatPercent(rec.shrunk) + "<br>"
+                    + "Complaint count: " + formatCount(rec.n) + "<br>"
+                    + "Share in this state: " + formatPercent(rec.share) + "<br>"
+                    + "Share in the United States: " + formatPercent(us && us.share);
+            });
+
+        svg.call(tip);
+
+        d3.select("#companyDropdown").on("change", function() {
+            selectCompany(this.value);
+        });
+        d3.select("#productDropdown").on("change", function() {
+            selectProduct(this.value);
+        });
+        d3.select("#subIssueDropdown").on("change", function() {
+            redraw();
+        });
+
+        Promise.all([
+            d3.json("data/us-states.json"),
+            d3.json("data/complaint_index.json")
+        ]).then(function(files) {
+            ready(files[0], files[1]);
+        }).catch(function() {
+            d3.select("#status").text("Could not load the map or the complaint index.");
+        });
+
+        function ready(states, index) {
+            companies = index;
+            companies.forEach(function(company) {
+                companyByName[company.name] = company;
+            });
+
+            projection.fitSize([mapWidth, mapHeight], states);
+
+            statePaths = svg.append("g")
+                .attr("id", "states")
+                .selectAll("path")
+                .data(states.features)
+                .enter()
+                .append("path")
+                .attr("d", path)
+                .attr("stroke", "white")
+                .attr("stroke-width", 0.6)
+                .attr("fill", "#d9d9d9")
+                .on("mouseover", function(d) {
+                    hovered = d;
+                    statePaths.attr("stroke", "white").attr("stroke-width", 0.6);
+                    d3.select(this).attr("stroke", "#111").attr("stroke-width", 2);
+                    drawLines(d.id, d.properties.name);
+                    tip.show(d);
+                    d3.select("#tooltip").style("pointer-events", "none");
+                })
+                .on("mouseout", function() {
+                    var next = d3.event && d3.event.relatedTarget;
+                    var tipNode = document.getElementById("tooltip");
+                    if (next && tipNode && (next === tipNode || tipNode.contains(next))) {
+                        return;
+                    }
+                    if (next && next.closest && next.closest("#states")) {
+                        return;
+                    }
+                    hovered = null;
+                    d3.select(this).attr("stroke", "white").attr("stroke-width", 0.6);
+                    drawLines(null, "United States");
+                    tip.hide();
+                });
+
+            updateLegend();
+            fillSelect("#companyDropdown", [ALL_COMPANIES].concat(companies.map(function(d) { return d.name; })));
+            selectCompany(richest(companies).name);
+        }
+
+        function selectCompany(name) {
+            var token = ++loadToken;
+            d3.select("#companyDropdown").property("value", name);
+            var productList = name === ALL_COMPANIES ? allProducts() : companyByName[name].products;
+            var product = richest(productList);
+            fillSelect("#productDropdown", productList.map(function(d) { return d.name; }), product.name);
+            fillSubIssues(product, richest(product.sub_issues).name);
+            var pending = name === ALL_COMPANIES ? loadAllCompanies() : loadCompany(companyByName[name]);
+            pending.then(function(rows) {
+                if (token !== loadToken) {
+                    return;
+                }
+                activeRows = rows;
+                redraw();
+            }).catch(function() {
+                d3.select("#status").text("Could not load the company data.");
+            });
+        }
+
+        function selectProduct(name) {
+            var companyName = d3.select("#companyDropdown").property("value");
+            var productList = companyName === ALL_COMPANIES ? allProducts() : companyByName[companyName].products;
+            var product = findByName(productList, name);
+            fillSubIssues(product, richest(product.sub_issues).name);
+            redraw();
+        }
+
+        function fillSubIssues(product, selected) {
+            fillSelect("#subIssueDropdown", product.sub_issues.map(function(d) { return d.name; }), selected);
+        }
+
+        function loadCompany(company) {
+            var cached = bucketCache[company.bucket];
+            if (cached) {
+                d3.select("#status").text("");
+                return Promise.resolve(cached[company.name] || []);
+            }
+            d3.select("#status").text("Loading " + company.name + "…");
+            return d3.json("data/series/b" + company.bucket + ".json").then(function(payload) {
+                bucketCache[company.bucket] = payload;
+                d3.select("#status").text("");
+                return payload[company.name] || [];
+            });
+        }
+
+        function allProducts() {
+            var byName = {};
+            companies.forEach(function(company) {
+                company.products.forEach(function(product) {
+                    if (!byName[product.name]) {
+                        byName[product.name] = {name: product.name, n: 0, subByName: {}};
+                    }
+                    var dest = byName[product.name];
+                    dest.n += product.n || 0;
+                    product.sub_issues.forEach(function(sub) {
+                        if (!dest.subByName[sub.name]) {
+                            dest.subByName[sub.name] = {name: sub.name, n: 0};
+                        }
+                        dest.subByName[sub.name].n += sub.n || 0;
+                    });
+                });
+            });
+            return Object.keys(byName).map(function(key) {
+                var product = byName[key];
+                return {
+                    name: product.name,
+                    n: product.n,
+                    sub_issues: Object.keys(product.subByName).map(function(sub) { return product.subByName[sub]; })
+                };
+            });
+        }
+
+        function loadAllCompanies() {
+            var seen = {};
+            var buckets = [];
+            companies.forEach(function(company) {
+                if (!seen[company.bucket]) {
+                    seen[company.bucket] = true;
+                    buckets.push(company.bucket);
+                }
+            });
+            d3.select("#status").text("Loading all companies…");
+            return Promise.all(buckets.map(function(bucket) {
+                if (bucketCache[bucket]) {
+                    return Promise.resolve();
+                }
+                return d3.json("data/series/b" + bucket + ".json").then(function(payload) {
+                    bucketCache[bucket] = payload;
+                });
+            })).then(function() {
+                var rows = [];
+                companies.forEach(function(company) {
+                    var list = (bucketCache[company.bucket] || {})[company.name] || [];
+                    rows = rows.concat(list);
+                });
+                d3.select("#status").text("");
+                return rows;
+            });
+        }
+
+        function redraw() {
+            var product = d3.select("#productDropdown").property("value");
+            var subIssue = d3.select("#subIssueDropdown").property("value");
+            prepared = analyze(activeRows, product, subIssue);
+            selectedYear = prepared.years.length ? prepared.years[prepared.years.length - 1] : null;
+            refreshYear();
+        }
+
+        function refreshYear() {
+            d3.select("#status").text(statusForYear());
+            updateMap();
+            updateLegend();
+            drawLines(activeScope.id, activeScope.label);
+            if (hovered) {
+                tip.show(hovered);
+            }
+        }
+
+        function analyze(rows, product, subIssue) {
+            var byState = {};
+            var national = {};
+            rows.forEach(function(row) {
+                if (!row || row[0] !== product) {
+                    return;
+                }
+                var year = +row[3];
+                var count = +row[4];
+                var nr = +row[5];
+                var nc = +row[6];
+                if (year > LAST_COMPLETE_YEAR || !isFinite(year) || !isFinite(count) || !isFinite(nr) || !isFinite(nc)) {
+                    return;
+                }
+                var state = row[2];
+                if (!byState[state]) {
+                    byState[state] = {};
+                }
+                addDenom(byState[state], year, count);
+                addDenom(national, year, count);
+                if (row[1] === subIssue) {
+                    addCounts(byState[state], year, count, nr, nc);
+                    addCounts(national, year, count, nr, nc);
+                }
+            });
+
+            var years = Object.keys(national).map(Number).sort(function(a, b) {
+                return a - b;
+            });
+            finishBucket(national, years);
+            Object.keys(byState).forEach(function(state) {
+                finishBucket(byState[state], years);
+            });
+
+            var yearUsesWithin = {};
+            years.forEach(function(year) {
+                var nat = national[year];
+                var lambda = nat && nat.denom > 0 ? nat.n / nat.denom : null;
+                var rateRows = [];
+                Object.keys(byState).forEach(function(state) {
+                    var rec = byState[state][year];
+                    if (!rec) {
+                        return;
+                    }
+                    rec.expected = lambda != null && rec.denom > 0 ? lambda * rec.denom : null;
+                    rec.within = withinGap(byState[state], years, year);
+                    if (rec.nc > 0) {
+                        rateRows.push(rec);
+                    }
+                });
+                var prior = betaShrink(rateRows);
+                nat.shrunk = nat.rate;
+                rateRows.forEach(function(rec) {
+                    rec.shrunk = shrunkRate(rec.nr, rec.nc, prior);
+                });
+
+                var candidates = [];
+                Object.keys(byState).forEach(function(state) {
+                    var rec = byState[state][year];
+                    rec.zWithin = null;
+                    rec.zAgainst = null;
+                    rec.zShrunk = null;
+                    rec.score = null;
+                    var sizeOk = rec.expected != null && rec.expected >= 5;
+                    var againstOk = rec.excess != null && isFinite(rec.excess);
+                    var reliefOk = rec.shrunk != null && isFinite(rec.shrunk);
+                    if (sizeOk && againstOk && reliefOk) {
+                        candidates.push(rec);
+                    }
+                });
+                var withWithin = candidates.filter(function(rec) {
+                    return rec.within != null && isFinite(rec.within);
+                });
+                var useWithin = withWithin.length >= 3;
+                var pool = useWithin ? withWithin : candidates;
+                var withinStats = robustStats(pool.map(function(rec) { return rec.within; }));
+                var againstStats = robustStats(pool.map(function(rec) { return rec.excess; }));
+                var reliefStats = robustStats(pool.map(function(rec) { return rec.shrunk; }));
+                pool.forEach(function(rec) {
+                    if (useWithin) {
+                        rec.zWithin = zScore(rec.within, withinStats);
+                    }
+                    rec.zAgainst = zScore(rec.excess, againstStats);
+                    rec.zShrunk = zScore(rec.shrunk, reliefStats);
+                    var parts = useWithin ? [rec.zWithin, rec.zAgainst, rec.zShrunk] : [rec.zAgainst, rec.zShrunk];
+                    if (parts.every(function(z) { return z != null && isFinite(z); })) {
+                        rec.score = 0;
+                        parts.forEach(function(z) { rec.score += z; });
+                    }
+                });
+                yearUsesWithin[year] = useWithin;
+            });
+
+            return {byState: byState, national: national, years: years, yearUsesWithin: yearUsesWithin};
+        }
+
+        function finishBucket(bucket, years) {
+            years.forEach(function(year, i) {
+                var rec = bucket[year];
+                if (!rec) {
+                    rec = {n: 0, nr: 0, nc: 0, denom: 0};
+                    bucket[year] = rec;
+                }
+                rec.share = rec.denom > 0 ? rec.n / rec.denom : null;
+                rec.rate = rec.nc > 0 ? rec.nr / rec.nc : null;
+                rec.expected = null;
+                rec.excess = null;
+                rec.within = null;
+                rec.shrunk = null;
+                rec.score = null;
+                var prevYear = i > 0 ? years[i - 1] : null;
+                if (prevYear != null && year === prevYear + 1) {
+                    var prev = bucket[prevYear];
+                    if (prev && (prev.n > 0 || prev.denom > 0)) {
+                        var other = Math.max(0, rec.denom - rec.n);
+                        var prevOther = Math.max(0, prev.denom - prev.n);
+                        rec.excess = logGap(rec.n, prev.n) - logGap(other, prevOther);
+                    }
+                }
+            });
+        }
+
+        function withinGap(bucket, years, year) {
+            var now = countGrowth(bucket, year);
+            if (now == null) {
+                return null;
+            }
+            var earlier = [];
+            years.forEach(function(candidate) {
+                if (candidate >= year) {
+                    return;
+                }
+                var growth = countGrowth(bucket, candidate);
+                if (growth != null && isFinite(growth)) {
+                    earlier.push(growth);
+                }
+            });
+            if (!earlier.length) {
+                return null;
+            }
+            earlier.sort(function(a, b) { return a - b; });
+            return now - median(earlier);
+        }
+
+        function countGrowth(bucket, year) {
+            var rec = bucket[year];
+            var prev = bucket[year - 1];
+            if (!rec || !prev || !(prev.n > 0 || prev.denom > 0)) {
+                return null;
+            }
+            return logGap(rec.n, prev.n);
+        }
+
+        function logGap(current, previous) {
+            return Math.log(current + 0.5) - Math.log(Math.max(0, previous) + 0.5);
+        }
+
+        function betaShrink(records) {
+            var totalNr = 0;
+            var totalNc = 0;
+            records.forEach(function(rec) {
+                totalNr += rec.nr;
+                totalNc += rec.nc;
+            });
+            var mu = totalNc > 0 ? totalNr / totalNc : 0;
+            if (records.length < 2) {
+                return {mu: mu, kappa: 0};
+            }
+            var sumSq = 0;
+            records.forEach(function(rec) {
+                var p = rec.nr / rec.nc;
+                sumSq += (p - mu) * (p - mu);
+            });
+            var variance = sumSq / (records.length - 1);
+            var meanSamp = 0;
+            records.forEach(function(rec) {
+                meanSamp += mu * (1 - mu) / rec.nc;
+            });
+            meanSamp /= records.length;
+            var extra = variance - meanSamp;
+            var spread = mu * (1 - mu);
+            var kappa = 0;
+            if (!(extra > 1e-8) && spread > 0) {
+                kappa = totalNc;
+            } else if (extra > 1e-8 && spread > 0) {
+                kappa = spread / extra - 1;
+                if (kappa < 0) {
+                    kappa = 0;
+                }
+            }
+            return {mu: mu, kappa: kappa};
+        }
+
+        function shrunkRate(nr, nc, prior) {
+            if (!(nc > 0)) {
+                return null;
+            }
+            return (nr + prior.kappa * prior.mu) / (nc + prior.kappa);
+        }
+
+        function robustStats(values) {
+            var xs = values.filter(function(value) { return value != null && isFinite(value); }).sort(function(a, b) {
+                return a - b;
+            });
+            if (!xs.length) {
+                return {median: 0, mad: 0};
+            }
+            var mid = median(xs);
+            var devs = xs.map(function(value) { return Math.abs(value - mid); }).sort(function(a, b) {
+                return a - b;
+            });
+            return {median: mid, mad: median(devs)};
+        }
+
+        function median(sorted) {
+            if (!sorted.length) {
+                return 0;
+            }
+            var mid = Math.floor(sorted.length / 2);
+            if (sorted.length % 2) {
+                return sorted[mid];
+            }
+            return (sorted[mid - 1] + sorted[mid]) / 2;
+        }
+
+        function zScore(value, stats) {
+            if (value == null || !isFinite(value) || !stats) {
+                return null;
+            }
+            var scale = 1.4826 * stats.mad;
+            if (!(scale > 0)) {
+                return 0;
+            }
+            return (value - stats.median) / scale;
+        }
+
+        function stateRecord(stateId) {
+            if (!prepared || selectedYear == null || !prepared.byState[stateId]) {
+                return null;
+            }
+            return prepared.byState[stateId][selectedYear] || null;
+        }
+
+        function nationalRecord() {
+            if (!prepared || selectedYear == null) {
+                return null;
+            }
+            return prepared.national[selectedYear] || null;
+        }
+
+        function scoreFill(rec) {
+            if (!rec || rec.score == null || selectedYear == null) {
+                return "#d9d9d9";
+            }
+            var parts = prepared.yearUsesWithin[selectedYear]
+                ? [rec.zWithin, rec.zAgainst, rec.zShrunk]
+                : [rec.zAgainst, rec.zShrunk];
+            var allHigh = parts.every(function(z) { return z != null && z > 0; });
+            if (allHigh && rec.score >= 1) {
+                return "#a50f15";
+            }
+            if (allHigh) {
+                return "#fdae6b";
+            }
+            return "#deebf7";
+        }
+
+        function watchLabel(rec) {
+            var fill = scoreFill(rec);
+            if (fill === "#a50f15") {
+                return "Watch out";
+            }
+            if (fill === "#fdae6b") {
+                return "Elevated";
+            }
+            if (fill === "#deebf7") {
+                return "Typical or lower";
+            }
+            return "Too little data";
+        }
+
+        function updateMap() {
+            if (!statePaths) {
+                return;
+            }
+            statePaths.attr("fill", function(d) {
+                return scoreFill(stateRecord(d.id));
+            });
+        }
+
+        function updateLegend() {
+            var legend = svg.select("#legend");
+            if (legend.empty()) {
+                legend = svg.append("g")
+                    .attr("id", "legend")
+                    .attr("transform", "translate(20," + (mapHeight + 24) + ")");
+            }
+            legend.selectAll("*").remove();
+            var title = "Concern score" + (selectedYear != null ? ", " + selectedYear : "");
+            var items = [
+                ["#d9d9d9", "Too little data"],
+                ["#deebf7", "Typical or lower"],
+                ["#fdae6b", "Elevated"],
+                ["#a50f15", "Watch out"]
+            ];
+            legend.append("text").attr("y", 0).attr("font-size", 12).attr("font-weight", 600).text(title);
+            items.forEach(function(item, i) {
+                var row = legend.append("g").attr("transform", "translate(0," + (14 + i * 20) + ")");
+                row.append("rect").attr("width", 28).attr("height", 14).attr("fill", item[0]).attr("stroke", "#ccc");
+                row.append("text").attr("x", 34).attr("y", 12).attr("font-size", 11).text(item[1]);
+            });
+        }
+
+        function drawLines(stateId, label) {
+            activeScope = {id: stateId, label: label};
+            if (!prepared) {
+                return;
+            }
+            scopeLabel.text(label);
+            var bucket = stateId ? (prepared.byState[stateId] || {}) : prepared.national;
+            var points = prepared.years.map(function(year) {
+                var rec = bucket[year] || {};
+                return {
+                    year: year,
+                    share: rec.share != null && isFinite(rec.share) ? rec.share : null,
+                    excess: rec.excess != null && isFinite(rec.excess) ? rec.excess: null,
+                    rate: rec.rate != null && isFinite(rec.rate) ? rec.rate : null,
+                    shrunk: rec.shrunk != null && isFinite(rec.shrunk) ? rec.shrunk : null
+                };
+            });
+            var emptyGrowth = stateId ? "No growth comparison for " + label : "No growth comparison for this selection";
+            var emptyRate = stateId ? "No closed complaints in " + label : "No closed complaints for this selection";
+            var emptyShare = stateId ? "No complaints in " + label : "No complaints for this selection";
+            drawLineChart(shareChart, "Sub-Issue share of complaints for this product", points, [
+                {get: function(d) { return d.share; }, stroke: "#2171b5"}
+            ], "rate", emptyShare);
+            drawLineChart(rateChart, "No-relief rate", points, [
+                {get: function(d) { return d.rate; }, stroke: "#fcae91"},
+                {get: function(d) { return d.shrunk; }, stroke: "#cb181d"}
+            ], "rate", emptyRate);
+        }
+
+        function drawLineChart(group, title, points, seriesList, yMode, emptyText) {
+            group.selectAll("*").remove();
+            group.append("text")
+                .attr("class", "chart-title")
+                .attr("x", chartMargin.left)
+                .attr("y", 32)
+                .text(title);
+
+            var innerWidth = chartWidth - chartMargin.left - chartMargin.right;
+            var innerHeight = chartHeight - chartMargin.top - chartMargin.bottom;
+            var g = group.append("g")
+                .attr("transform", "translate(" + chartMargin.left + "," + chartMargin.top + ")");
+
+            var defined = [];
+            seriesList.forEach(function(series) {
+                points.forEach(function(d) {
+                    var value = series.get(d);
+                    if (value != null && isFinite(value)) {
+                        defined.push(value);
+                    }
+                });
+            });
+            if (!defined.length || !prepared.years.length) {
+                g.append("text").attr("y", innerHeight / 2).attr("fill", "#666").text(emptyText);
+                return;
+            }
+
+            var x = d3.scaleLinear()
+                .domain(d3.extent(prepared.years))
+                .range([0, innerWidth]);
+            var y;
+            if (yMode === "rate") {
+                var yMax = d3.max(defined);
+                y = d3.scaleLinear().domain([0, yMax > 0 ? yMax : 1]).nice().range([innerHeight, 0]);
+            } else {
+                var lo = Math.min(0, d3.min(defined));
+                var hi = Math.max(0, d3.max(defined));
+                if (lo === hi) {
+                    hi = lo + 1;
+                }
+                y = d3.scaleLinear().domain([lo, hi]).nice().range([innerHeight, 0]);
+            }
+
+            g.append("g")
+                .attr("class", "axis")
+                .attr("transform", "translate(0," + innerHeight + ")")
+                .call(d3.axisBottom(x).tickValues(yearTicks(prepared.years)).tickFormat(d3.format("d")));
+            g.append("g")
+                .attr("class", "axis")
+                .call(d3.axisLeft(y).ticks(5).tickFormat(yMode === "rate" ? percentTick : d3.format("+.1f")));
+
+            if (selectedYear != null) {
+                g.append("line")
+                    .attr("x1", x(selectedYear))
+                    .attr("x2", x(selectedYear))
+                    .attr("y1", 0)
+                    .attr("y2", innerHeight)
+                    .attr("stroke", "#666")
+                    .attr("stroke-dasharray", "3 3");
+            }
+
+            seriesList.forEach(function(series) {
+                var line = d3.line()
+                    .defined(function(d) { return series.get(d) != null && isFinite(series.get(d)); })
+                    .x(function(d) { return x(d.year); })
+                    .y(function(d) { return y(series.get(d)); });
+                g.append("path")
+                    .datum(points)
+                    .attr("fill", "none")
+                    .attr("stroke", series.stroke)
+                    .attr("stroke-width", 2)
+                    .attr("d", line);
+                g.selectAll(null)
+                    .data(points.filter(function(d) { return series.get(d) != null && isFinite(series.get(d)); }))
+                    .enter()
+                    .append("circle")
+                    .attr("cx", function(d) { return x(d.year); })
+                    .attr("cy", function(d) { return y(series.get(d)); })
+                    .attr("r", function(d) { return d.year === selectedYear ? 6 : 3; })
+                    .attr("fill", series.stroke)
+                    .attr("stroke", function(d) { return d.year === selectedYear ? "#111" : "none"; })
+                    .attr("stroke-width", 1.5);
+            });
+        }
+
+        function statusForYear() {
+            if (!prepared || !prepared.years.length) {
+                return "No complaints through 2025 for this selection.";
+            }
+            if (prepared.years.length < 2) {
+                return "Need at least two consecutive years to judge growth.";
+            }
+            if (selectedYear != null && selectedYear < LAST_COMPLETE_YEAR) {
+                return "This selection has no 2025 data. The map shows " + selectedYear + ".";
+            }
+            if (selectedYear != null && !prepared.yearUsesWithin[selectedYear]) {
+                return "2025 has no earlier growth to compare with each state's own past. The score uses other complaints and the no-relief rate.";
+            }
+            return "";
+        }
+
+        function fillSelect(selector, values, selected) {
+            var menu = d3.select(selector);
+            menu.selectAll("option").remove();
+            menu.selectAll("option")
+                .data(values)
+                .enter()
+                .append("option")
+                .attr("value", function(d) { return d; })
+                .attr("title", function(d) { return d; })
+                .text(function(d) { return d; });
+            if (selected && values.indexOf(selected) !== -1) {
+                menu.property("value", selected);
+            }
+        }
+
+        function richest(items) {
+            return items.slice().sort(function(a, b) {
+                return b.n - a.n;
+            })[0];
+        }
+
+        function findByName(items, name) {
+            for (var i = 0; i < items.length; i++) {
+                if (items[i].name === name) {
+                    return items[i];
+                }
+            }
+            return items[0];
+        }
+
+        function ensure(bucket, year) {
+            if (!bucket[year]) {
+                bucket[year] = {n: 0, nr: 0, nc: 0, denom: 0};
+            }
+            return bucket[year];
+        }
+
+        function addDenom(bucket, year, count) {
+            ensure(bucket, year).denom += count;
+        }
+
+        function addCounts(bucket, year, count, nr, nc) {
+            var rec = ensure(bucket, year);
+            rec.n += count;
+            rec.nr += nr;
+            rec.nc += nc;
+        }
+
+        function yearTicks(years) {
+            if (years.length <= 6) {
+                return years;
+            }
+            var step = Math.ceil(years.length / 6);
+            var ticks = [];
+            for (var i = 0; i < years.length; i += step) {
+                ticks.push(years[i]);
+            }
+            if (ticks[ticks.length - 1] !== years[years.length - 1]) {
+                ticks.push(years[years.length - 1]);
+            }
+            return ticks;
+        }
+
+        function formatPercent(value) {
+            if (value == null || isNaN(value)) {
+                return "N/A";
+            }
+            return d3.format(".1%")(value);
+        }
+
+        function percentTick(value) {
+            if (value > 0 && value < 0.01) {
+                return d3.format(".1%")(value);
+            }
+            return d3.format(".0%")(value);
+        }
+
+        function formatSigned(value, spec) {
+            if (value == null || !isFinite(value)) {
+                return "N/A";
+            }
+            return d3.format(spec)(value);
+        }
+
+        function formatCount(value) {
+            if (value == null || !isFinite(value)) {
+                return "N/A";
+            }
+            return d3.format(",.0f")(value);
+        }
+
+        function formatExpected(value) {
+            if (value == null || !isFinite(value)) {
+                return "N/A";
+            }
+            return d3.format(",.1f")(value);
+        }
+
+        function escapeHtml(value) {
+            return String(value)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;");
+        }
+    </script>
+</body>
+</html>
