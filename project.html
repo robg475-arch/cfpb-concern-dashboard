@@ -683,6 +683,31 @@
                 {get: function(d) { return d.rate; }, stroke: "#fcae91"},
                 {get: function(d) { return d.shrunk; }, stroke: "#cb181d"}
             ], "rate", emptyRate);
+            drawRateKey();
+        }
+
+        function drawRateKey() {
+            var key = rateChart.append("g")
+                .attr("class", "rate-key")
+                .attr("transform", "translate(" + (chartWidth - 156) + ",32)");
+            [
+                {stroke: "#fcae91", label: "Raw", x: 0},
+                {stroke: "#cb181d", label: "Adjusted", x: 62}
+            ].forEach(function(item) {
+                key.append("line")
+                    .attr("x1", item.x)
+                    .attr("x2", item.x + 18)
+                    .attr("y1", -4)
+                    .attr("y2", -4)
+                    .attr("stroke", item.stroke)
+                    .attr("stroke-width", 2);
+                key.append("text")
+                    .attr("x", item.x + 24)
+                    .attr("y", 0)
+                    .attr("font-size", 11)
+                    .attr("fill", "#333")
+                    .text(item.label);
+            });
         }
 
         function drawLineChart(group, title, points, seriesList, yMode, emptyText) {
