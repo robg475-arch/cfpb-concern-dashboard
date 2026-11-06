@@ -42,6 +42,10 @@
             margin-left: 6px;
         }
 
+        #yearDropdown {
+            width: 90px;
+        }
+
         #status {
             font-size: 13px;
             min-height: 18px;
@@ -78,7 +82,7 @@
 <body>
     <h1>Concerns to watch out for in 2025</h1>
     <p class="note">
-        Choose a company, product, and sub-issue. The map shows 2025. 2026 is left out because the year is not finished.
+        Choose a company, product, sub-issue, and year. The map shows that year. 2026 is left out because the year is not finished.
         A state is a watch-out when this sub-issue is growing faster than that state's own past and faster than the company's other complaints, and the adjusted no-relief rate is high.
         Gray means there is not enough data to judge. Hover a state for the share, both growth gaps, and the no-relief rates.
         The lines show every year through 2025. The pale no-relief line is the raw rate, and the dark line is adjusted for a small number of complaints.
@@ -88,6 +92,7 @@
     <label>Company <select id="companyDropdown"></select></label>
     <label>Product <select id="productDropdown"></select></label>
     <label>Sub-issue <select id="subIssueDropdown"></select></label>
+    <label>Year <select id="yearDropdown"></select></label>
     <p id="status">Loading complaints…</p>
 
     <script>
@@ -168,6 +173,10 @@
         });
         d3.select("#subIssueDropdown").on("change", function() {
             redraw();
+        });
+        d3.select("#yearDropdown").on("change", function() {
+            selectedYear = +this.value;
+            refreshYear();
         });
 
         Promise.all([
@@ -329,7 +338,12 @@
             var product = d3.select("#productDropdown").property("value");
             var subIssue = d3.select("#subIssueDropdown").property("value");
             prepared = analyze(activeRows, product, subIssue);
-            selectedYear = prepared.years.length ? prepared.years[prepared.years.length - 1] : null;
+            var years = prepared.years;
+            var next = years.indexOf(selectedYear) !== -1
+                ? selectedYear
+                : (years.length ? years[years.length - 1] : null);
+            fillSelect("#yearDropdown", years, next);
+            selectedYear = next;
             refreshYear();
         }
 
@@ -802,11 +816,12 @@
             if (prepared.years.length < 2) {
                 return "Need at least two consecutive years to judge growth.";
             }
-            if (selectedYear != null && selectedYear < LAST_COMPLETE_YEAR) {
+            var latest = prepared.years[prepared.years.length - 1];
+            if (selectedYear != null && selectedYear === latest && latest < LAST_COMPLETE_YEAR) {
                 return "This selection has no 2025 data. The map shows " + selectedYear + ".";
             }
             if (selectedYear != null && !prepared.yearUsesWithin[selectedYear]) {
-                return "2025 has no earlier growth to compare with each state's own past. The score uses other complaints and the no-relief rate.";
+                return selectedYear + " has no earlier growth to compare with each state's own past. The score uses other complaints and the no-relief rate.";
             }
             return "";
         }
